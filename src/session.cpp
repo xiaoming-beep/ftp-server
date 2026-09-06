@@ -10,6 +10,10 @@
 #include <sstream>
 #include <thread>
 
+#ifndef _WIN32
+#include <sys/select.h>
+#endif
+
 namespace ftp {
 
 using namespace std;
@@ -108,125 +112,116 @@ static bool addr_equal(const asio::ip::address& a, const asio::ip::address& b) {
     return x == y;
 }
 
+static bool wait_socket_ready(tcp::socket& s, int timeout_ms);
+
 bool Session::open_data_conn(shared_ptr<tcp::socket>& out) {
     auto stop_wait = [&]() {
         return closing_.load() || server_.stopping();
     };
 
     if (pasv_) {
-        auto st = make_shared<DataWait>();
-        st->sock = make_shared<tcp::socket>(ioc_);
-        st->acc = pasv_;
-        st->timer = make_unique<asio::steady_timer>(ioc_);
-        arm_pasv_accept(st); // 来源不符/瞬时失败时在内部重新武装，直到超时
-        st->timer->expires_after(kDataAcceptTimeout);
-        // 定时器回调只持 weak_ptr：Windows IOCP 上被取消的等待可能拖到原超时点
-        // 才投递，若强持有 st 会让数据 socket 的引用一直存活到那时，
-        // 传输结束后 FIN 发不出去（客户端收不到 EOF）
-        weak_ptr<DataWait> weak = st;
-        st->timer->async_wait([weak](error_code e) {
-            if (auto s = weak.lock()) {
-                if (!e) { // 正常超时（未被取消）
-                    s->done = true;
-                    s->ok = false;
-                    error_code ce;
-                    s->acc->cancel(ce);
+        // PASV 模式下必须先回 150 再等数据连接：Windows 资源管理器的 FTP 客户端
+        // 收到 150 之前不会连接数据端口，反过来等会让双方互相卡死。
+        // PORT 模式不需要：客户端在发命令前就已监听数据端口。
+        send_reply(150, "Opening data connection");
+        // 同步非阻塞 accept + 轮询：asio 异步 accept 存在边缘触发丢事件的问题
+        // （客户端赶在命令到达前连接时，事件可能被之前 transfer 的轮询吞掉，
+        // accept 永不完成，客户端超时）。轮询是电平判断，连接一定可见。
+        error_code ec;
+        pasv_->non_blocking(true, ec);
+        auto deadline = chrono::steady_clock::now() + kDataAcceptTimeout;
+        auto acc = pasv_;
+        while (true) {
+            if (stop_wait() || chrono::steady_clock::now() >= deadline) break;
+            shared_ptr<tcp::socket> s = make_shared<tcp::socket>(ioc_);
+            error_code ce;
+            acc->accept(*s, ce);
+            if (!ce) {
+                tcp::endpoint rem = s->remote_endpoint(ce);
+                if (!ce && addr_equal(rem.address(), peer_addr_)) {
+                    s->non_blocking(true, ce);
+                    pasv_.reset();
+                    out = s;
+                    return true;
                 }
+                // 来源不是控制连接的对端：丢弃这条连接并继续等待（防 PASV 抢占）
+                s->close(ce);
+                continue;
             }
-        });
-        while (!st->done) {
-            if (stop_wait()) {
-                st->done = true;
-                st->ok = false;
-                error_code ce;
-                st->acc->cancel(ce);
-                st->timer->cancel(ce);
-                break;
+            if (ce == asio::error::would_block || ce == asio::error::try_again) {
+                this_thread::sleep_for(chrono::milliseconds(10));
+                continue;
             }
-            ioc_.run_one_for(chrono::milliseconds(50));
+            break; // 其他错误：放弃本次数据连接
         }
-        ioc_.poll(); // 清掉被取消但仍在队列中的回调（它们持有 st，安全）
         pasv_.reset();
-        if (!st->ok) return false;
-        error_code ce;
-        // Windows IOCP 上 accept 出来的 socket 默认是阻塞模式，同步收发会一直
-        // 卡在内核里，忙等循环和停滞超时都依赖 would_block，必须显式设非阻塞
-        st->sock->non_blocking(true, ce);
-        out = st->sock;
-        return true;
+        return false;
     }
 
     if (port_ep_) {
-        auto st = make_shared<DataWait>();
-        st->sock = make_shared<tcp::socket>(ioc_);
-        st->timer = make_unique<asio::steady_timer>(ioc_);
-        tcp::endpoint ep = *port_ep_;
-        // 先打开并设为非阻塞：POSIX 上 cancel() 只对非阻塞 socket 生效
+        // 非阻塞 connect + select 等待完成：主动模式连接也走异步反应器的话，
+        // 与 PASV 同样存在事件丢失风险（见上面注释）。select + SO_ERROR
+        // 不依赖反应器，各平台行为一致。
         error_code oe;
-        st->sock->open(ep.protocol(), oe);
-        if (!oe) st->sock->non_blocking(true, oe);
-        if (oe) return false;
-        st->sock->async_connect(ep, [st](error_code e) {
-            st->ok = !e;
-            st->done = true;
-            st->timer->cancel();
-        });
-        st->timer->expires_after(kConnectTimeout);
-        // 同 PASV 路径：定时器回调只持 weak_ptr，避免拖住 socket 的存活时间
-        weak_ptr<DataWait> weak = st;
-        st->timer->async_wait([weak](error_code e) {
-            if (auto s = weak.lock()) {
-                if (!e) { // 连接超时：取消 connect
-                    error_code ce;
-                    s->sock->cancel(ce);
-                }
-            }
-        });
-        while (!st->done) {
-            if (stop_wait()) {
-                st->done = true;
-                st->ok = false;
-                error_code ce;
-                st->sock->cancel(ce);
-                st->timer->cancel(ce);
-                break;
-            }
-            ioc_.run_one_for(chrono::milliseconds(50));
-        }
-        ioc_.poll();
-        port_ep_.reset();
-        if (!st->ok) return false;
+        tcp::endpoint ep = *port_ep_;
+        shared_ptr<tcp::socket> s = make_shared<tcp::socket>(ioc_);
+        s->open(ep.protocol(), oe);
+        if (!oe) s->non_blocking(true, oe);
+        if (oe) { port_ep_.reset(); return false; }
+        auto deadline = chrono::steady_clock::now() + kConnectTimeout;
         error_code ce;
-        st->sock->non_blocking(true, ce); // 后续同步收发依赖非阻塞忙等
-        out = st->sock;
+        s->connect(ep, ce);
+        if (ce && ce != asio::error::in_progress && ce != asio::error::would_block) {
+            port_ep_.reset();
+            return false; // 连接被拒/网络不可达等明确失败
+        }
+        while (ce) {
+            if (stop_wait() || chrono::steady_clock::now() >= deadline) {
+                port_ep_.reset();
+                return false;
+            }
+            if (!wait_socket_ready(*s, 100)) continue; // 还没结果，继续等
+            int soerr = 0;
+#ifdef _WIN32
+            int len = sizeof(soerr);
+#else
+            socklen_t len = sizeof(soerr);
+#endif
+            ::getsockopt(s->native_handle(), SOL_SOCKET, SO_ERROR,
+                         reinterpret_cast<char*>(&soerr), &len);
+            if (soerr == 0) {
+                ce = error_code(); // 连接完成
+            } else if (soerr != asio::error::in_progress &&
+                       soerr != asio::error::would_block) {
+                ce = error_code(soerr, asio::error::get_system_category());
+                port_ep_.reset();
+                return false;
+            }
+            // soerr 仍是 in_progress：继续等待（理论上不会走到）
+        }
+        port_ep_.reset();
+        send_reply(150, "Opening data connection");
+        out = s;
         return true;
     }
     return false; // 客户端未先发 PASV/EPSV/PORT/EPRT
 }
 
-void Session::arm_pasv_accept(shared_ptr<DataWait> st) {
-    st->acc->async_accept(*st->sock, [this, st](error_code e) {
-        if (st->done) return;
-        if (e == asio::error::operation_aborted) return; // 超时/关闭路径负责收尾
-        if (e) { // 其余错误：放弃本次数据连接
-            st->done = true;
-            st->ok = false;
-            st->timer->cancel();
-            return;
-        }
-        error_code ce;
-        tcp::endpoint rem = st->sock->remote_endpoint(ce);
-        if (!ce && addr_equal(rem.address(), peer_addr_)) {
-            st->done = true;
-            st->ok = true;
-            st->timer->cancel();
-            return;
-        }
-        // 来源不是控制连接的对端：丢弃这条连接并继续等待（防 PASV 抢占）
-        st->sock->close(ce);
-        st->sock = make_shared<tcp::socket>(ioc_);
-        arm_pasv_accept(st);
-    });
+// select 等待 socket 可写（用于非阻塞 connect 完成检测）。
+// 返回 true 表示已有结果（可写/出错），false 表示超时。
+static bool wait_socket_ready(tcp::socket& s, int timeout_ms) {
+    fd_set wset;
+    FD_ZERO(&wset);
+    FD_SET(s.native_handle(), &wset);
+    timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+#ifdef _WIN32
+    int r = ::select(0, nullptr, &wset, nullptr, &tv);
+#else
+    int r = ::select(int(s.native_handle()) + 1, nullptr, &wset, nullptr, &tv);
+#endif
+    return r > 0;
 }
 
 bool Session::send_all(tcp::socket& s, const string& data) {
@@ -520,7 +515,6 @@ void Session::handle_command(const string& line) {
         }
         shared_ptr<tcp::socket> data;
         if (!open_data_conn(data)) { send_reply(425, "Can't open data connection"); return; }
-        send_reply(150, "Opening data connection");
         bool ok = send_file(*data, *real);
         rest_ = 0;
         send_reply(ok ? 226 : 426,
@@ -541,7 +535,6 @@ void Session::handle_command(const string& line) {
         }
         shared_ptr<tcp::socket> data;
         if (!open_data_conn(data)) { send_reply(425, "Can't open data connection"); return; }
-        send_reply(150, "Opening data connection");
         bool ok = recv_file(*data, *real, cmd == "APPE");
         rest_ = 0;
         send_reply(ok ? 226 : 426,
@@ -750,7 +743,6 @@ void Session::do_list(bool with_details, const string& arg) {
 
     shared_ptr<tcp::socket> data;
     if (!open_data_conn(data)) { send_reply(425, "Can't open data connection"); return; }
-    send_reply(150, "Opening data connection");
     bool ok = send_all(*data, payload);
     send_reply(ok ? 226 : 426,
                ok ? "Transfer complete" : "Connection closed; transfer aborted");
