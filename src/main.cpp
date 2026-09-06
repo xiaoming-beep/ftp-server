@@ -3,7 +3,6 @@
 #include "util.h"
 
 #include <atomic>
-#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -26,11 +25,10 @@ void request_stop() {
 
 #ifdef _WIN32
 BOOL WINAPI ctrl_handler(DWORD /*type*/) {
+    // 在独立线程回调，可以安全地调用非 async-signal-safe 的函数
     request_stop();
     return TRUE;
 }
-#else
-void on_signal(int /*sig*/) { request_stop(); }
 #endif
 
 void usage() {
@@ -39,6 +37,7 @@ void usage() {
         "  -path <dir>      FTP root directory (default: current directory)\n"
         "  -port <port>     Listen port (default: 21)\n"
         "  -ro              Read-only mode (disable upload/delete/rename etc.)\n"
+        "  -stall <sec>     Data transfer stall timeout (default: 60)\n"
         "  -h, --help       Show this help\n"
         "\n"
         "Examples:\n"
@@ -53,6 +52,7 @@ int main(int argc, char** argv) {
 
     fs::path root = fs::current_path();
     unsigned long port = 21;
+    unsigned long stall = 60;
     bool read_only = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -84,6 +84,21 @@ int main(int argc, char** argv) {
             port = v;
         } else if (a == "-ro" || a == "--ro") {
             read_only = true;
+        } else if (a == "-stall" || a == "--stall") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "Error: -stall missing seconds argument\n");
+                usage();
+                return 2;
+            }
+            char* end = nullptr;
+            unsigned long v = std::strtoul(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || v == 0 || v > 86400) {
+                std::fprintf(stderr, "Error: invalid stall timeout \"%s\" (range 1-86400 seconds)\n",
+                             argv[i]);
+                usage();
+                return 2;
+            }
+            stall = v;
         } else {
             std::fprintf(stderr, "Error: unknown argument \"%s\"\n", a.c_str());
             usage();
@@ -100,16 +115,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    Config cfg{abs_root, static_cast<unsigned short>(port), read_only};
+    Config cfg{abs_root, static_cast<unsigned short>(port), read_only,
+               std::chrono::seconds(stall)};
     Server server(cfg);
     g_server.store(&server);
 
 #ifdef _WIN32
     SetConsoleCtrlHandler(ctrl_handler, TRUE);
-#else
-    std::signal(SIGINT, on_signal);
-    std::signal(SIGTERM, on_signal);
 #endif
+    // 非 Windows 平台：SIGINT/SIGTERM 由 Server 内部的 asio::signal_set 处理
 
     int rc = server.run();
     g_server.store(nullptr);

@@ -21,7 +21,8 @@ static constexpr auto kDataAcceptTimeout = chrono::seconds(30); // PASV 等待�
 static constexpr auto kConnectTimeout = chrono::seconds(10);    // PORT 主动连接超时
 
 Session::Session(Server& server, shared_ptr<tcp::socket> control)
-    : server_(server), vfs_(server.vfs()), control_(std::move(control)) {}
+    : server_(server), vfs_(server.vfs()), control_(std::move(control)),
+      stall_timeout_(server.config().stall_timeout) {}
 
 void Session::close() { closing_.store(true); }
 
@@ -58,16 +59,22 @@ bool Session::read_line(string& out) {
 
 bool Session::send_raw(const string& data) {
     size_t off = 0;
+    auto last_progress = chrono::steady_clock::now();
     while (off < data.size()) {
         error_code ec;
         size_t n = control_->send(asio::buffer(data.data() + off, data.size() - off), 0, ec);
         if (ec == asio::error::would_block || ec == asio::error::try_again) {
             if (closing_.load()) return false;
+            if (chrono::steady_clock::now() - last_progress > stall_timeout_) {
+                log_error("Control connection send stall timeout, disconnecting");
+                return false;
+            }
             this_thread::sleep_for(chrono::milliseconds(10));
             continue;
         }
         if (ec) return false;
         off += n;
+        last_progress = chrono::steady_clock::now();
     }
     return true;
 }
@@ -91,55 +98,135 @@ bool Session::send_multiline(int code, const string& first,
 
 // ---------------- 数据连接 ----------------
 
+// 地址相等性比较（把 IPv4-mapped IPv6 归一化后比较）
+static bool addr_equal(const asio::ip::address& a, const asio::ip::address& b) {
+    asio::ip::address x = a, y = b;
+    if (x.is_v6() && x.to_v6().is_v4_mapped())
+        x = asio::ip::make_address_v4(asio::ip::v4_mapped, x.to_v6());
+    if (y.is_v6() && y.to_v6().is_v4_mapped())
+        y = asio::ip::make_address_v4(asio::ip::v4_mapped, y.to_v6());
+    return x == y;
+}
+
 bool Session::open_data_conn(shared_ptr<tcp::socket>& out) {
+    auto stop_wait = [&]() {
+        return closing_.load() || server_.stopping();
+    };
+
     if (pasv_) {
-        auto sock = make_shared<tcp::socket>(ioc_);
-        auto acc = pasv_;
-        bool done = false, ok = false;
-        asio::steady_timer timer(ioc_);
-        acc->async_accept(*sock, [&](error_code e) {
-            ok = !e;
-            done = true;
-            timer.cancel(); // 无论成败都停掉定时器
+        auto st = make_shared<DataWait>();
+        st->sock = make_shared<tcp::socket>(ioc_);
+        st->acc = pasv_;
+        st->timer = make_unique<asio::steady_timer>(ioc_);
+        arm_pasv_accept(st); // 来源不符/瞬时失败时在内部重新武装，直到超时
+        st->timer->expires_after(kDataAcceptTimeout);
+        // 定时器回调只持 weak_ptr：Windows IOCP 上被取消的等待可能拖到原超时点
+        // 才投递，若强持有 st 会让数据 socket 的引用一直存活到那时，
+        // 传输结束后 FIN 发不出去（客户端收不到 EOF）
+        weak_ptr<DataWait> weak = st;
+        st->timer->async_wait([weak](error_code e) {
+            if (auto s = weak.lock()) {
+                if (!e) { // 正常超时（未被取消）
+                    s->done = true;
+                    s->ok = false;
+                    error_code ce;
+                    s->acc->cancel(ce);
+                }
+            }
         });
-        timer.expires_after(kDataAcceptTimeout);
-        timer.async_wait([&](error_code e) {
-            if (!e) acc->cancel(); // 超时：取消 accept 让上面 handler 结束
-        });
-        while (!done) ioc_.run_one();
+        while (!st->done) {
+            if (stop_wait()) {
+                st->done = true;
+                st->ok = false;
+                error_code ce;
+                st->acc->cancel(ce);
+                st->timer->cancel(ce);
+                break;
+            }
+            ioc_.run_one_for(chrono::milliseconds(50));
+        }
+        ioc_.poll(); // 清掉被取消但仍在队列中的回调（它们持有 st，安全）
         pasv_.reset();
-        if (!ok) return false;
-        out = sock;
+        if (!st->ok) return false;
+        error_code ce;
+        // Windows IOCP 上 accept 出来的 socket 默认是阻塞模式，同步收发会一直
+        // 卡在内核里，忙等循环和停滞超时都依赖 would_block，必须显式设非阻塞
+        st->sock->non_blocking(true, ce);
+        out = st->sock;
         return true;
     }
+
     if (port_ep_) {
-        auto sock = make_shared<tcp::socket>(ioc_);
-        error_code ec;
-        sock->open(port_ep_->protocol(), ec);
-        if (!ec) sock->non_blocking(true, ec);
-        auto deadline = chrono::steady_clock::now() + kConnectTimeout;
-        while (!ec && chrono::steady_clock::now() < deadline) {
-            error_code ce;
-            sock->connect(*port_ep_, ce);
-            if (!ce) break;
-            if (ce == asio::error::would_block || ce == asio::error::in_progress ||
-                ce == asio::error::try_again) {
-                if (closing_.load()) {
-                    ec = ce;
-                    break;
+        auto st = make_shared<DataWait>();
+        st->sock = make_shared<tcp::socket>(ioc_);
+        st->timer = make_unique<asio::steady_timer>(ioc_);
+        tcp::endpoint ep = *port_ep_;
+        // 先打开并设为非阻塞：POSIX 上 cancel() 只对非阻塞 socket 生效
+        error_code oe;
+        st->sock->open(ep.protocol(), oe);
+        if (!oe) st->sock->non_blocking(true, oe);
+        if (oe) return false;
+        st->sock->async_connect(ep, [st](error_code e) {
+            st->ok = !e;
+            st->done = true;
+            st->timer->cancel();
+        });
+        st->timer->expires_after(kConnectTimeout);
+        // 同 PASV 路径：定时器回调只持 weak_ptr，避免拖住 socket 的存活时间
+        weak_ptr<DataWait> weak = st;
+        st->timer->async_wait([weak](error_code e) {
+            if (auto s = weak.lock()) {
+                if (!e) { // 连接超时：取消 connect
+                    error_code ce;
+                    s->sock->cancel(ce);
                 }
-                this_thread::sleep_for(chrono::milliseconds(50));
-                continue;
             }
-            ec = ce;
-            break;
+        });
+        while (!st->done) {
+            if (stop_wait()) {
+                st->done = true;
+                st->ok = false;
+                error_code ce;
+                st->sock->cancel(ce);
+                st->timer->cancel(ce);
+                break;
+            }
+            ioc_.run_one_for(chrono::milliseconds(50));
         }
+        ioc_.poll();
         port_ep_.reset();
-        if (ec) return false;
-        out = sock;
+        if (!st->ok) return false;
+        error_code ce;
+        st->sock->non_blocking(true, ce); // 后续同步收发依赖非阻塞忙等
+        out = st->sock;
         return true;
     }
     return false; // 客户端未先发 PASV/EPSV/PORT/EPRT
+}
+
+void Session::arm_pasv_accept(shared_ptr<DataWait> st) {
+    st->acc->async_accept(*st->sock, [this, st](error_code e) {
+        if (st->done) return;
+        if (e == asio::error::operation_aborted) return; // 超时/关闭路径负责收尾
+        if (e) { // 其余错误：放弃本次数据连接
+            st->done = true;
+            st->ok = false;
+            st->timer->cancel();
+            return;
+        }
+        error_code ce;
+        tcp::endpoint rem = st->sock->remote_endpoint(ce);
+        if (!ce && addr_equal(rem.address(), peer_addr_)) {
+            st->done = true;
+            st->ok = true;
+            st->timer->cancel();
+            return;
+        }
+        // 来源不是控制连接的对端：丢弃这条连接并继续等待（防 PASV 抢占）
+        st->sock->close(ce);
+        st->sock = make_shared<tcp::socket>(ioc_);
+        arm_pasv_accept(st);
+    });
 }
 
 bool Session::send_all(tcp::socket& s, const string& data) {
@@ -148,17 +235,25 @@ bool Session::send_all(tcp::socket& s, const string& data) {
 
 bool Session::send_all(tcp::socket& s, const char* data, size_t len) {
     size_t off = 0;
+    auto last_progress = chrono::steady_clock::now();
     while (off < len) {
         error_code ec;
         size_t n = s.send(asio::buffer(data + off, len - off), 0, ec);
         if (ec == asio::error::would_block || ec == asio::error::try_again) {
             // Windows 上 asio 的 socket 底层可能是非阻塞的，忙等一小会儿重试
             if (closing_.load() || server_.stopping()) return false;
+            if (chrono::steady_clock::now() - last_progress > stall_timeout_) {
+                // 对端停滞（如客户端卡死/网络中断未挥手）：断开并释放文件句柄，
+                // 否则线程会永远忙等，Windows 上被传的文件也会一直被占用无法删除
+                log_error("Data connection send stall timeout, aborting transfer");
+                return false;
+            }
             this_thread::sleep_for(chrono::milliseconds(10));
             continue;
         }
         if (ec) return false;
         off += n;
+        last_progress = chrono::steady_clock::now();
     }
     return true;
 }
@@ -213,12 +308,19 @@ bool Session::recv_file(tcp::socket& data, const fs::path& real, bool append) {
 
     bool pending_cr = false;
     char buf[65536];
+    auto last_progress = chrono::steady_clock::now();
     while (true) {
         error_code ec;
         size_t n = data.receive(asio::buffer(buf), 0, ec);
         if (ec == asio::error::would_block || ec == asio::error::try_again) {
             // Windows 上 asio 的 socket 底层可能是非阻塞的：没数据就等一会儿
             if (closing_.load() || server_.stopping()) return false;
+            if (chrono::steady_clock::now() - last_progress > stall_timeout_) {
+                // 对端停滞：断开并关闭文件（析构即释放句柄），
+                // 避免线程永久占用导致服务器上的文件无法删除
+                log_error("Data connection receive stall timeout, aborting transfer");
+                return false;
+            }
             this_thread::sleep_for(chrono::milliseconds(50));
             continue;
         }
@@ -228,6 +330,7 @@ bool Session::recv_file(tcp::socket& data, const fs::path& real, bool append) {
             return false;
         }
         if (n == 0) break; // 客户端关闭数据连接 -> 传输正常结束
+        last_progress = chrono::steady_clock::now();
 
         if (type_ == 'A') {
             // ASCII 模式：CRLF -> LF（CR 单独出现则保留）
@@ -549,7 +652,18 @@ void Session::do_port(const string& arg) {
     error_code ec;
     auto addr = asio::ip::make_address(ip, ec);
     if (ec) { send_reply(501, "Bad PORT address"); return; }
-    port_ep_ = tcp::endpoint(addr, (unsigned short)(o[4] * 256 + o[5]));
+    // 防 FTP 弹跳攻击：数据连接目标必须就是控制连接的客户端本身，
+    // 否则服务器会被滥用为对第三方主机/端口的扫描与攻击跳板
+    if (!addr_equal(addr, peer_addr_)) {
+        send_reply(501, "PORT address must match client address");
+        return;
+    }
+    unsigned short port = (unsigned short)(o[4] * 256 + o[5]);
+    if (port < 1024) { // 低端口目标是弹跳攻击的典型用法（SSH/SMTP 等），拒绝
+        send_reply(501, "PORT target port must be >= 1024");
+        return;
+    }
+    port_ep_ = tcp::endpoint(addr, port);
     send_reply(200, "PORT command successful");
 }
 
@@ -580,6 +694,15 @@ void Session::do_eprt(const string& arg) {
     }
     if (ec || port == 0 || port > 65535) {
         send_reply(501, "Bad EPRT syntax");
+        return;
+    }
+    // 防 FTP 弹跳攻击，同 PORT
+    if (!addr_equal(addr, peer_addr_)) {
+        send_reply(501, "EPRT address must match client address");
+        return;
+    }
+    if (port < 1024) {
+        send_reply(501, "EPRT target port must be >= 1024");
         return;
     }
     port_ep_ = tcp::endpoint(addr, (unsigned short)port);
@@ -638,7 +761,10 @@ void Session::run() {
     control_->non_blocking(true, ec);
     auto remote = control_->remote_endpoint(ec);
     string peer = "?";
-    if (!ec) peer = remote.address().to_string() + ":" + to_string(remote.port());
+    if (!ec) {
+        peer = remote.address().to_string() + ":" + to_string(remote.port());
+        peer_addr_ = remote.address(); // 供 PORT/EPRT/PASV 来源校验使用
+    }
     last_activity_ = chrono::steady_clock::now();
 
     log_info("Connection: " + peer);
@@ -647,6 +773,9 @@ void Session::run() {
     string line;
     while (!closing_.load() && read_line(line)) {
         handle_command(line);
+        // 命令可能携带长时间的文件传输，传输本身也是活动；
+        // 否则传完一个大文件后会立刻被空闲超时误判踢掉
+        last_activity_ = chrono::steady_clock::now();
         if (want_quit_) break;
     }
 

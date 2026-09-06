@@ -36,7 +36,17 @@ private:
     void handle_command(const std::string& line);
 
     // 数据连接
+    // 异步等待数据连接就绪的共享状态。回调通过 shared_ptr 持有它，
+    // 即使回调在函数返回后才被投递，也不会触碰已销毁的栈变量。
+    struct DataWait {
+        std::shared_ptr<asio::ip::tcp::socket> sock;
+        std::shared_ptr<asio::ip::tcp::acceptor> acc;
+        std::unique_ptr<asio::steady_timer> timer;
+        bool done = false;
+        bool ok = false;
+    };
     bool open_data_conn(std::shared_ptr<asio::ip::tcp::socket>& out);
+    void arm_pasv_accept(std::shared_ptr<DataWait> st);
     bool send_all(asio::ip::tcp::socket& s, const std::string& data);
     bool send_all(asio::ip::tcp::socket& s, const char* data, std::size_t len);
     bool send_file(asio::ip::tcp::socket& data, const std::filesystem::path& real);
@@ -55,6 +65,8 @@ private:
     asio::io_context ioc_;
     std::shared_ptr<asio::ip::tcp::socket> control_;
     std::chrono::steady_clock::time_point last_activity_;
+    std::chrono::seconds stall_timeout_; // 数据连接停滞超时（无字节进展即断开）
+    asio::ip::address peer_addr_;        // 控制连接对端地址（PORT/PASV 来源校验用）
     std::string recv_buf_;  // 控制连接的行缓冲
 
     std::string cwd_ = "/";

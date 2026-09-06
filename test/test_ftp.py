@@ -10,15 +10,20 @@ import io
 import os
 import random
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 
-EXE = sys.argv[1] if len(sys.argv) > 1 else r"M:\ftp-server\build\ftp-server.exe"
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_EXE = os.path.join(HERE, "..", "build",
+                           "ftp-server" + (".exe" if os.name == "nt" else ""))
+EXE = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_EXE
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 3721
 RO_PORT = PORT + 1  # 只读模式服务器端口
+STALL_PORT = PORT + 2  # -stall 短超时服务器端口（停滞传输/连接超时测试用）
 
 ROOT = tempfile.mkdtemp(prefix="ftp_srv_test_")
 procs = []
@@ -73,9 +78,30 @@ def expect_prefix(fn, prefix, *a, **k):
         return str(e).startswith(prefix)
 
 
+def raw_ctrl(port):
+    """裸 socket 控制连接，返回 (sock, cmd, read_reply)。
+    用于 ftplib 发不出来的命令（非法字节、需要自己管理数据连接等场景）。"""
+    s = socket.create_connection(("127.0.0.1", port), timeout=30)
+    f = s.makefile("rb")
+
+    def read_reply():
+        return f.readline().decode("utf-8", "replace").strip()
+
+    def cmd(c):
+        s.sendall(c if isinstance(c, bytes) else (c + "\r\n").encode())
+        return read_reply()
+
+    read_reply()  # 220 欢迎语
+    cmd("USER a")
+    cmd("PASS b")
+    cmd("TYPE I")
+    return s, cmd, read_reply
+
+
 def main():
     start(PORT)
     start(RO_PORT, ["-ro"])
+    start(STALL_PORT, ["-stall", "2"])
 
     ftp = ftplib.FTP()
     ftp.connect("127.0.0.1", PORT, timeout=10)
@@ -125,6 +151,10 @@ def main():
     check("SIZE 正确", ftp.size("up.bin") == len(payload))
     check("SIZE 不存在 550", expects_550(ftp.size, "nope"))
     check("MDTM 格式", len(ftp.sendcmd("MDTM up.bin").split()[1]) == 14)
+    t0 = 1767225600  # 2026-01-01 00:00:00 UTC
+    os.utime(os.path.join(ROOT, "up.bin"), (t0, t0))
+    check("MDTM 为 UTC (RFC 3659)",
+          ftp.sendcmd("MDTM up.bin") == "213 " + time.strftime("%Y%m%d%H%M%S", time.gmtime(t0)))
     check("DELE", ftp.delete("up.bin").startswith("250"))
     check("DELE 不存在 550", expects_550(ftp.delete, "nope"))
 
@@ -225,6 +255,99 @@ def main():
     for t in ts:
         t.join()
     check("4 线程并发下载", not errors, str(errors))
+
+    banner("安全加固")
+    # 防 FTP 弹跳攻击：PORT/EPRT 目标必须就是客户端自己，且禁止低端口
+    check("PORT 弹跳目标 501", expect_prefix(ftp.sendcmd, "501", "PORT 8,8,8,8,4,1"))
+    check("PORT 低端口目标 501", expect_prefix(ftp.sendcmd, "501", "PORT 127,0,0,1,0,22"))
+    check("EPRT 弹跳目标 501", expect_prefix(ftp.sendcmd, "501", "EPRT |1|8.8.8.8|4444|"))
+    check("PORT 本机合法目标 200", ftp.sendcmd("PORT 127,0,0,1,255,254").startswith("200"))
+
+    # 非法 UTF-8 文件名必须拒绝，而不是静默解析到错误位置
+    s, cmd, rr = raw_ctrl(PORT)
+    check("非法 UTF-8 文件名 550",
+          cmd(b"RETR \xff\xfe.bin\r\n").startswith("550"))
+    s.close()
+
+    # PASV 数据端口来源校验：异源冒充者先连会被丢弃，真客户端传输不受影响。
+    # 冒充者用 127.0.0.2 作为源地址（loopback 网段内异于控制连接的 127.0.0.1）
+    s, cmd, rr = raw_ctrl(PORT)
+    r = cmd("PASV")
+    nums = r.split("(")[1].rstrip(")").split(",")
+    dport = int(nums[4]) * 256 + int(nums[5])
+    thief = socket.socket()
+    try:
+        thief.bind(("127.0.0.2", 0))
+    except OSError:
+        print("  SKIP  PASV 来源校验（本机不支持 127.0.0.2 回环源地址）")
+        thief.close()
+        s.close()
+    else:
+        thief.settimeout(3)
+        thief.connect(("127.0.0.1", dport))
+        time.sleep(0.2)
+        s.sendall(b"RETR blob.bin\r\n")  # 服务器 accept 到冒充者并将其关闭
+        thief.settimeout(5)
+        thief_closed = False
+        try:
+            while thief.recv(4096):
+                pass
+            thief_closed = True  # recv 返回空 -> 服务器关闭了冒充者连接
+        except socket.timeout:
+            pass
+        real = socket.create_connection(("127.0.0.1", dport), timeout=3)
+        got5 = b""
+        real.settimeout(10)
+        while True:
+            c = real.recv(65536)
+            if not c:
+                break
+            got5 += c
+        real.close()
+        thief.close()
+        check("PASV 异源抢占连接被丢弃、真客户端传输正常",
+              thief_closed and rr().startswith("150") and rr().startswith("226")
+              and got5 == payload)
+        s.close()
+
+    banner("停滞传输与连接超时 (-stall 2)")
+    # 黑洞 listener：接受连接但永不读取 -> 服务器停滞超时后应回 426 并释放文件
+    with open(os.path.join(ROOT, "stall.bin"), "wb") as f:
+        f.write(os.urandom(16 * 1024 * 1024))
+    bh = socket.socket()
+    bh.bind(("127.0.0.1", 0))
+    bh.listen(1)
+    bh_port = bh.getsockname()[1]
+    holder = []  # 持有 accept 到的连接，防止 GC 关闭它（否则 RST 会立刻中断传输）
+
+    def black_hole():
+        conn, _ = bh.accept()
+        holder.append(conn)
+
+    threading.Thread(target=black_hole, daemon=True).start()
+    s, cmd, rr = raw_ctrl(STALL_PORT)
+    cmd("PORT 127,0,0,1,%d,%d" % (bh_port >> 8, bh_port & 0xFF))
+    t = time.time()
+    cmd("RETR stall.bin")  # 150
+    reply = rr()
+    elapsed = time.time() - t
+    check("停滞传输超时 426 (%.1fs)" % elapsed,
+          reply.startswith("426") and 1.5 < elapsed < 20)
+    s.close()
+
+    # PORT 目标本机无监听端口 -> 连接被拒应回 425（仅一条应答）
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    free_port = probe.getsockname()[1]
+    probe.close()
+    s, cmd, rr = raw_ctrl(STALL_PORT)
+    cmd("PORT 127,0,0,1,%d,%d" % (free_port >> 8, free_port & 0xFF))
+    t = time.time()
+    reply = cmd("RETR blob.bin")
+    elapsed = time.time() - t
+    check("PORT 连接失败 425 (%.1fs)" % elapsed,
+          reply.startswith("425") and elapsed < 25)
+    s.close()
 
     banner("只读模式 (-ro)")
     ro = ftplib.FTP()

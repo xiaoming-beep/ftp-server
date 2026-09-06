@@ -69,7 +69,13 @@ optional<fs::path> Vfs::resolve(const string& cwd, const string& ftp_path) const
 
     // 4. 拼接到根目录下
     fs::path rel;
-    for (auto& part : parts) rel /= utf8_to_path(part);
+    for (auto& part : parts) {
+        fs::path conv = utf8_to_path(part);
+        // 客户端发来非法 UTF-8 时转换会失败并返回空路径，
+        // 若静默拼接等于跳过该分量、解析到错误位置，必须直接拒绝
+        if (conv.empty()) return nullopt;
+        rel /= conv;
+    }
     fs::path real = root_ / rel;
 
     // 5. 规范化并二次确认仍在根目录内（防止符号链接/联接逃逸）。

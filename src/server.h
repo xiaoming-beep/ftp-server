@@ -6,6 +6,8 @@
 #include <asio.hpp>
 
 #include <atomic>
+#include <chrono>
+#include <csignal>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -18,6 +20,7 @@ struct Config {
     std::filesystem::path root; // 已 canonical 化
     unsigned short port = 21;
     bool read_only = false;
+    std::chrono::seconds stall_timeout{60}; // 数据传输停滞超时，超时断开并释放文件
 };
 
 class Session;
@@ -46,9 +49,15 @@ private:
     Vfs vfs_;
     asio::io_context ioc_;
     asio::ip::tcp::acceptor acceptor_;
+#ifndef _WIN32
+    // POSIX 上不能在信号处理函数里加锁/操作 io_context（非 async-signal-safe，
+    // 会死锁）；asio::signal_set 把信号转为 io_context 里的普通回调来处理
+    asio::signal_set signals_;
+#endif
     std::atomic<bool> stop_{false};
     std::mutex mu_;
     std::vector<std::shared_ptr<Session>> sessions_;
+    int accept_errors_ = 0; // 连续 accept 失败计数，用于退避（如 fd 耗尽时避免热循环）
 };
 
 } // namespace ftp

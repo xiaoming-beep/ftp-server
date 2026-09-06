@@ -53,10 +53,11 @@ string now_str() {
 string mdtm_str(int64_t mtime) {
     time_t t = (time_t)mtime;
     tm tmv;
+    // RFC 3659 要求 MDTM 应答使用 UTC（客户端按 UTC 解析，用本地时间会偏差时区）
 #ifdef _WIN32
-    localtime_s(&tmv, &t);
+    gmtime_s(&tmv, &t);
 #else
-    localtime_r(&t, &tmv);
+    gmtime_r(&t, &tmv);
 #endif
     char buf[32];
     strftime(buf, sizeof buf, "%Y%m%d%H%M%S", &tmv);
